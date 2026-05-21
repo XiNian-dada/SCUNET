@@ -94,6 +94,9 @@ NMCLI_BIN = resolve_command(
 NETSH_BIN = resolve_command(
     [r"C:\Windows\System32\netsh.exe", "netsh"]
 )
+OSASCRIPT_BIN = resolve_command(
+    ["/usr/bin/osascript", "osascript"]
+)
 
 
 class ConfigError(RuntimeError):
@@ -164,9 +167,15 @@ class Config:
     allow_unknown_wifi_name: bool = False
     poll_interval_seconds: int = 1
     idle_interval_seconds: int = 1
+    preflight_connect_timeout_seconds: int = 2
+    preflight_max_time_seconds: int = 3
     connect_timeout_seconds: int = 3
     curl_max_time_seconds: int = 5
-    min_login_interval_seconds: int = 15
+    min_login_interval_seconds: int = 5
+    notifications_enabled: bool = True
+    notify_on_success: bool = True
+    notify_on_attempt: bool = True
+    notification_min_interval_seconds: int = 60
     password_source: str = ""
     password_env: str = "SCUNET_PASSWORD"
     password_command: Union[str, List[str], None] = None
@@ -223,8 +232,14 @@ class Config:
             raise ConfigError("config.poll_interval_seconds must be > 0")
         if self.idle_interval_seconds <= 0:
             raise ConfigError("config.idle_interval_seconds must be > 0")
+        if self.preflight_connect_timeout_seconds <= 0:
+            raise ConfigError("config.preflight_connect_timeout_seconds must be > 0")
+        if self.preflight_max_time_seconds <= 0:
+            raise ConfigError("config.preflight_max_time_seconds must be > 0")
         if self.min_login_interval_seconds < 0:
             raise ConfigError("config.min_login_interval_seconds must be >= 0")
+        if self.notification_min_interval_seconds < 0:
+            raise ConfigError("config.notification_min_interval_seconds must be >= 0")
         if self.password_source not in PASSWORD_SOURCES:
             raise ConfigError(
                 f"config.password_source must be one of: {', '.join(sorted(PASSWORD_SOURCES))}"
@@ -389,6 +404,7 @@ class SCUNETAutologinDaemon:
         self.hardware_ports_loaded_at = 0.0
         self.macos_wifi_interfaces: Dict[str, bool] = {}
         self.macos_wifi_interfaces_loaded_at = 0.0
+        self.last_notification_at: Dict[str, float] = {}
 
     def install_signal_handlers(self) -> None:
         signal.signal(signal.SIGINT, self._handle_stop)
@@ -398,10 +414,163 @@ class SCUNETAutologinDaemon:
         logging.info("received signal %s, stopping", signum)
         self.stop_requested = True
 
-    def set_state(self, state: str) -> None:
+    def set_state(self, state: str) -> bool:
         if state != self.last_state:
             logging.info("%s", state)
             self.last_state = state
+            return True
+        return False
+
+    def update_state(self, state: str, config: Optional[Config] = None) -> None:
+        changed = self.set_state(state)
+        if changed and config is not None:
+            self.maybe_notify_state(config, state)
+
+    def maybe_notify_state(self, config: Config, state: str) -> None:
+        if not IS_MACOS or not config.notifications_enabled:
+            return
+
+        notification_key = None
+        subtitle = None
+        body = None
+
+        context = self.notification_context(config)
+
+        if state == "login succeeded" and config.notify_on_success:
+            notification_key = "login_succeeded"
+            subtitle = "认证成功"
+            body = f"SCUNET 已完成自动认证。\n{context}"
+        elif state.startswith("login failed: "):
+            notification_key, subtitle, body = self.classify_login_failed_notification(
+                state.removeprefix("login failed: "),
+                context,
+            )
+        elif state.startswith("login command failed: "):
+            notification_key, subtitle, body = self.classify_command_failure_notification(
+                "login_command_failed",
+                state.removeprefix("login command failed: "),
+                context,
+            )
+        elif state.startswith("portal probe failed: "):
+            notification_key, subtitle, body = self.classify_command_failure_notification(
+                "portal_probe_failed",
+                state.removeprefix("portal probe failed: "),
+                context,
+            )
+        elif state.startswith("interface ") and " is not active" in state:
+            notification_key = "interface_inactive"
+            subtitle = "网卡未连接"
+            body = f"{state}\n{context}\n建议: 检查 Wi‑Fi 是否已连接到 SCUNET。"
+
+        if not notification_key or not body or not subtitle:
+            return
+
+        now = time.monotonic()
+        last_at = self.last_notification_at.get(notification_key, 0.0)
+        if now - last_at < config.notification_min_interval_seconds:
+            return
+
+        self.last_notification_at[notification_key] = now
+        self.send_macos_notification(subtitle, body)
+
+    def maybe_notify_login_attempt(self, config: Config) -> None:
+        if not IS_MACOS or not config.notifications_enabled or not config.notify_on_attempt:
+            return
+
+        notification_key = "login_attempt"
+        now = time.monotonic()
+        last_at = self.last_notification_at.get(notification_key, 0.0)
+        if now - last_at < config.notification_min_interval_seconds:
+            return
+
+        self.last_notification_at[notification_key] = now
+        self.send_macos_notification(
+            "开始认证",
+            f"检测到需要进行 SCUNET 认证。\n{self.notification_context(config)}",
+        )
+
+    def classify_login_failed_notification(
+        self,
+        message: str,
+        context: str,
+    ) -> Tuple[str, str, str]:
+        lower_message = message.lower()
+
+        if "用户不存在" in message or "username" in lower_message and "exist" in lower_message:
+            return (
+                "login_failed_username",
+                "用户名错误",
+                f"{message}\n{context}\n建议: 检查学号/用户名是否填写正确。",
+            )
+
+        if "密码" in message and ("错误" in message or "不对" in message):
+            return (
+                "login_failed_password",
+                "密码错误",
+                f"{message}\n{context}\n建议: 重新保存校园网密码后再试。",
+            )
+
+        if "服务" in message or "运营商" in message:
+            return (
+                "login_failed_service",
+                "运营商可能不对",
+                f"{message}\n{context}\n建议: 检查当前是否应使用 EDUNET / 电信 / 移动 / 联通。",
+            )
+
+        return (
+            "login_failed",
+            "认证失败",
+            f"{message}\n{context}",
+        )
+
+    def classify_command_failure_notification(
+        self,
+        key_prefix: str,
+        message: str,
+        context: str,
+    ) -> Tuple[str, str, str]:
+        lower_message = message.lower()
+
+        if "timed out" in lower_message:
+            return (
+                f"{key_prefix}_timeout",
+                "请求超时",
+                f"{message}\n{context}\n建议: 当前网络响应较慢，稍后会自动重试。",
+            )
+
+        if "curl failed" in lower_message:
+            return (
+                f"{key_prefix}_curl_failed",
+                "请求发送失败",
+                f"{message}\n{context}\n建议: 检查 Wi‑Fi 状态和门户地址是否可达。",
+            )
+
+        return (
+            key_prefix,
+            "认证异常" if key_prefix == "login_command_failed" else "网络探测异常",
+            f"{message}\n{context}",
+        )
+
+    def notification_context(self, config: Config) -> str:
+        return (
+            f"账号: {config.username}\n"
+            f"运营商: {config.service}\n"
+            f"网卡: {config.detect_interface}"
+        )
+
+    def send_macos_notification(self, subtitle: str, body: str) -> None:
+        def escape_apple_script(value: str) -> str:
+            return value.replace("\\", "\\\\").replace('"', '\\"')
+
+        script = (
+            f'display notification "{escape_apple_script(body)}" '
+            f'with title "SCUNET 自动认证" '
+            f'subtitle "{escape_apple_script(subtitle)}"'
+        )
+        try:
+            run_command([OSASCRIPT_BIN, "-e", script], timeout=5)
+        except CommandError:
+            logging.debug("failed to send macOS notification")
 
     def sleep_interruptibly(self, seconds: int) -> None:
         deadline = time.monotonic() + seconds
@@ -811,39 +980,89 @@ class SCUNETAutologinDaemon:
         config = load_config(self.config_path)
 
         if not config.auto_login_enabled:
-            self.set_state("auto login is disabled")
+            self.update_state("auto login is disabled", config)
             return config.idle_interval_seconds
+
+        # On macOS, portal detection is more reliable than querying Wi-Fi metadata,
+        # and it avoids repeated timeouts from system_profiler/networksetup.
+        if IS_MACOS and config.target_ssid:
+            portal_state, portal_message, query_string = self.probe_portal(
+                config,
+                connect_timeout_seconds=config.preflight_connect_timeout_seconds,
+                max_time_seconds=config.preflight_max_time_seconds,
+            )
+            if portal_state == "online":
+                self.update_state(portal_message, config)
+                return config.poll_interval_seconds
+            if portal_state == "non_portal":
+                self.update_state(portal_message, config)
+                return config.poll_interval_seconds
+            if portal_state == "offline":
+                self.update_state(f"portal probe failed: {portal_message}", config)
+                return config.poll_interval_seconds
+
+            self.update_state("SCUNET portal detected", config)
+
+            gap = time.monotonic() - self.last_login_attempt_at
+            if gap < config.min_login_interval_seconds:
+                remaining = int(config.min_login_interval_seconds - gap)
+                self.update_state(f"waiting for login cooldown ({remaining}s remaining)", config)
+                return config.poll_interval_seconds
+
+            if dry_run:
+                self.update_state("dry-run: login would be triggered now", config)
+                return config.poll_interval_seconds
+
+            self.last_login_attempt_at = time.monotonic()
+            logging.info("portal probe requires login, trying portal login")
+            self.maybe_notify_login_attempt(config)
+
+            try:
+                success, message = self.login(
+                    config,
+                    precomputed_query_string=query_string,
+                )
+            except (CommandError, ConfigError) as exc:
+                self.update_state(f"login command failed: {exc}", config)
+                return config.poll_interval_seconds
+
+            if success:
+                self.update_state(message, config)
+            else:
+                self.update_state(f"login failed: {message}", config)
+            return config.poll_interval_seconds
 
         should_attempt, reason = self.should_attempt_login(config)
         if not should_attempt:
-            self.set_state(reason)
+            self.update_state(reason, config)
             return config.idle_interval_seconds
 
         portal_state, portal_message, query_string = self.probe_portal(config)
         if portal_state == "online":
-            self.set_state(portal_message)
+            self.update_state(portal_message, config)
             return config.poll_interval_seconds
         if portal_state == "non_portal":
-            self.set_state(portal_message)
+            self.update_state(portal_message, config)
             return config.poll_interval_seconds
         if portal_state == "offline":
-            self.set_state(f"portal probe failed: {portal_message}")
+            self.update_state(f"portal probe failed: {portal_message}", config)
             return config.poll_interval_seconds
 
-        self.set_state(reason)
+        self.update_state(reason, config)
 
         gap = time.monotonic() - self.last_login_attempt_at
         if gap < config.min_login_interval_seconds:
             remaining = int(config.min_login_interval_seconds - gap)
-            self.set_state(f"waiting for login cooldown ({remaining}s remaining)")
+            self.update_state(f"waiting for login cooldown ({remaining}s remaining)", config)
             return config.poll_interval_seconds
 
         if dry_run:
-            self.set_state("dry-run: login would be triggered now")
+            self.update_state("dry-run: login would be triggered now", config)
             return config.poll_interval_seconds
 
         self.last_login_attempt_at = time.monotonic()
         logging.info("portal probe requires login, trying portal login")
+        self.maybe_notify_login_attempt(config)
 
         try:
             success, message = self.login(
@@ -851,13 +1070,13 @@ class SCUNETAutologinDaemon:
                 precomputed_query_string=query_string,
             )
         except (CommandError, ConfigError) as exc:
-            self.set_state(f"login command failed: {exc}")
+            self.update_state(f"login command failed: {exc}", config)
             return config.poll_interval_seconds
 
         if success:
-            self.set_state(message)
+            self.update_state(message, config)
         else:
-            self.set_state(f"login failed: {message}")
+            self.update_state(f"login failed: {message}", config)
         return config.poll_interval_seconds
 
     def run_once(self, *, dry_run: bool = False) -> int:
