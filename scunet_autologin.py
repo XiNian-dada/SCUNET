@@ -21,8 +21,6 @@ from urllib.parse import quote, quote_plus
 
 SYSTEM = platform.system().lower()
 IS_MACOS = SYSTEM == "darwin"
-IS_LINUX = SYSTEM == "linux"
-IS_WINDOWS = SYSTEM == "windows"
 
 DEFAULT_CONFIG_NAME = "config.json"
 DEFAULT_USER_AGENT = (
@@ -54,45 +52,11 @@ CURL_BIN = resolve_command(
         "/usr/bin/curl",
         "/usr/local/bin/curl",
         "/opt/homebrew/bin/curl",
-        r"C:\Windows\System32\curl.exe",
         "curl",
     ]
 )
-PING_BIN = resolve_command(
-    [
-        "/sbin/ping",
-        "/usr/sbin/ping",
-        "/bin/ping",
-        r"C:\Windows\System32\PING.EXE",
-        "ping",
-    ]
-)
-IFCONFIG_BIN = resolve_command(
-    ["/sbin/ifconfig", "/usr/sbin/ifconfig", "ifconfig"]
-)
-IPCONFIG_BIN = resolve_command(
-    ["/usr/sbin/ipconfig", "/sbin/ipconfig", "ipconfig"]
-)
-NETWORKSETUP_BIN = resolve_command(
-    ["/usr/sbin/networksetup", "networksetup"]
-)
 SECURITY_BIN = resolve_command(
     ["/usr/bin/security", "security"]
-)
-IP_BIN = resolve_command(
-    ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "ip"]
-)
-IW_BIN = resolve_command(
-    ["/usr/sbin/iw", "/sbin/iw", "/usr/bin/iw", "iw"]
-)
-IWGETID_BIN = resolve_command(
-    ["/usr/sbin/iwgetid", "/sbin/iwgetid", "/usr/bin/iwgetid", "iwgetid"]
-)
-NMCLI_BIN = resolve_command(
-    ["/usr/bin/nmcli", "/usr/sbin/nmcli", "nmcli"]
-)
-NETSH_BIN = resolve_command(
-    [r"C:\Windows\System32\netsh.exe", "netsh"]
 )
 OSASCRIPT_BIN = resolve_command(
     ["/usr/bin/osascript", "osascript"]
@@ -115,18 +79,8 @@ def split_command(value: Union[str, List[str]]) -> List[str]:
     if isinstance(value, list):
         return [str(part) for part in value]
     if isinstance(value, str):
-        return shlex.split(value, posix=not IS_WINDOWS)
+        return shlex.split(value, posix=True)
     raise ConfigError("password_command must be a JSON string or array")
-
-
-def looks_like_bind_address(value: str) -> bool:
-    if not value or " " in value:
-        return False
-    if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", value):
-        return True
-    if ":" in value:
-        return True
-    return "." in value
 
 
 def decode_unicode_escapes(value: str) -> str:
@@ -157,14 +111,10 @@ def extract_error_message(body: str) -> Optional[str]:
 class Config:
     username: str
     service: str = "EDUNET"
-    target_ssid: str = "SCUNET"
     detect_interface: str = "PUT_INTERFACE_NAME_HERE"
     login_bind: str = ""
-    ping_bind: str = ""
-    ping_address: str = "222.220.212.130"
     probe_url: str = "http://192.168.2.135/"
     auto_login_enabled: bool = True
-    allow_unknown_wifi_name: bool = False
     poll_interval_seconds: int = 1
     idle_interval_seconds: int = 1
     preflight_connect_timeout_seconds: int = 2
@@ -191,17 +141,11 @@ class Config:
             interface = normalized["interface"]
             normalized.setdefault("detect_interface", interface)
             normalized.setdefault("login_bind", interface)
-            normalized.setdefault("ping_bind", interface)
-
-        if normalized.get("ssid") and not normalized.get("target_ssid"):
-            normalized["target_ssid"] = normalized["ssid"]
 
         if normalized.get("login_interface") and not normalized.get("login_bind"):
             normalized["login_bind"] = normalized["login_interface"]
-        if normalized.get("ping_interface") and not normalized.get("ping_bind"):
-            normalized["ping_bind"] = normalized["ping_interface"]
         if "password_source" not in normalized:
-            normalized["password_source"] = "macos_keychain" if IS_MACOS else "env"
+            normalized["password_source"] = "macos_keychain"
 
         dataclass_keys = {field.name for field in fields(cls)}
         clean = {key: normalized[key] for key in normalized if key in dataclass_keys}
@@ -209,11 +153,11 @@ class Config:
 
         if not config.login_bind:
             config.login_bind = config.detect_interface
-        if not config.ping_bind:
-            config.ping_bind = config.detect_interface
         return config
 
     def validate(self) -> None:
+        if not IS_MACOS:
+            raise ConfigError("this daemon only supports macOS")
         if not self.username or self.username.startswith("PUT_"):
             raise ConfigError("config.username is missing or still uses the placeholder value")
         if not self.detect_interface or self.detect_interface.startswith("PUT_"):
@@ -224,8 +168,6 @@ class Config:
             raise ConfigError(
                 f"config.service must be one of: {', '.join(sorted(SERVICE_CODES))}"
             )
-        if not self.ping_address:
-            raise ConfigError("config.ping_address is required")
         if not self.probe_url:
             raise ConfigError("config.probe_url is required")
         if self.poll_interval_seconds <= 0:
@@ -244,8 +186,6 @@ class Config:
             raise ConfigError(
                 f"config.password_source must be one of: {', '.join(sorted(PASSWORD_SOURCES))}"
             )
-        if self.password_source == "macos_keychain" and not IS_MACOS:
-            raise ConfigError("password_source=macos_keychain is only supported on macOS")
         if self.password_source == "env" and not self.password_env:
             raise ConfigError("config.password_env is required for password_source=env")
         if self.password_source == "command" and not self.password_command:
@@ -269,14 +209,7 @@ def load_config(path: Path) -> Config:
 
 
 def default_log_path() -> Path:
-    if IS_MACOS:
-        return expand_path("~/Library/Logs/SCUNETAutologin/daemon.log")
-    if IS_LINUX:
-        return expand_path("~/.local/state/scunet-autologin/daemon.log")
-    if IS_WINDOWS:
-        appdata = os.environ.get("APPDATA", "~")
-        return expand_path(f"{appdata}/SCUNETAutologin/daemon.log")
-    return expand_path("~/scunet-autologin.log")
+    return expand_path("~/Library/Logs/SCUNETAutologin/daemon.log")
 
 
 def setup_logging(verbose: bool) -> None:
@@ -400,10 +333,6 @@ class SCUNETAutologinDaemon:
         self.stop_requested = False
         self.last_state: Optional[str] = None
         self.last_login_attempt_at = 0.0
-        self.hardware_ports: Dict[str, str] = {}
-        self.hardware_ports_loaded_at = 0.0
-        self.macos_wifi_interfaces: Dict[str, bool] = {}
-        self.macos_wifi_interfaces_loaded_at = 0.0
         self.last_notification_at: Dict[str, float] = {}
 
     def install_signal_handlers(self) -> None:
@@ -577,261 +506,6 @@ class SCUNETAutologinDaemon:
         while not self.stop_requested and time.monotonic() < deadline:
             time.sleep(min(1.0, max(0.1, deadline - time.monotonic())))
 
-    def refresh_hardware_ports(self, force: bool = False) -> None:
-        if not IS_MACOS:
-            return
-
-        now = time.monotonic()
-        if not force and now - self.hardware_ports_loaded_at < 300:
-            return
-
-        result = run_command([NETWORKSETUP_BIN, "-listallhardwareports"], timeout=5)
-        if result.returncode != 0:
-            logging.debug("networksetup hardware port lookup unavailable on this Mac")
-            self.hardware_ports = {}
-            self.hardware_ports_loaded_at = now
-            return
-
-        current_port = None
-        mapping: Dict[str, str] = {}
-        for line in result.stdout.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("Hardware Port: "):
-                current_port = stripped.split(": ", 1)[1]
-            elif stripped.startswith("Device: ") and current_port:
-                device = stripped.split(": ", 1)[1]
-                mapping[device] = current_port
-
-        self.hardware_ports = mapping
-        self.hardware_ports_loaded_at = now
-
-    def refresh_macos_wifi_interfaces(self, force: bool = False) -> None:
-        if not IS_MACOS:
-            return
-
-        now = time.monotonic()
-        if not force and now - self.macos_wifi_interfaces_loaded_at < 300:
-            return
-
-        result = run_command(
-            ["/usr/sbin/system_profiler", "SPAirPortDataType", "-json"],
-            timeout=10,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            self.macos_wifi_interfaces = {}
-            self.macos_wifi_interfaces_loaded_at = now
-            return
-
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            self.macos_wifi_interfaces = {}
-            self.macos_wifi_interfaces_loaded_at = now
-            return
-
-        names: Dict[str, bool] = {}
-        for top_level in payload.get("SPAirPortDataType", []):
-            interfaces = top_level.get("spairport_airport_interfaces", [])
-            for iface in interfaces:
-                name = iface.get("_name")
-                if isinstance(name, str) and name:
-                    names[name] = True
-
-        self.macos_wifi_interfaces = names
-        self.macos_wifi_interfaces_loaded_at = now
-
-    def interface_hardware_port(self, interface: str) -> Optional[str]:
-        self.refresh_hardware_ports()
-        return self.hardware_ports.get(interface)
-
-    def linux_interface_is_active(self, interface: str) -> bool:
-        operstate = Path("/sys/class/net") / interface / "operstate"
-        if operstate.exists():
-            state = operstate.read_text(encoding="utf-8").strip().lower()
-            if state in {"up", "unknown"}:
-                return True
-            if state in {"down", "dormant", "notpresent"}:
-                return False
-
-        result = run_command([IP_BIN, "link", "show", "dev", interface], timeout=5)
-        if result.returncode != 0:
-            return False
-        output = result.stdout
-        return "LOWER_UP" in output or "state UP" in output
-
-    def windows_interface_rows(self) -> List[Dict[str, str]]:
-        result = run_command([NETSH_BIN, "interface", "show", "interface"], timeout=5)
-        if result.returncode != 0:
-            return []
-
-        rows: List[Dict[str, str]] = []
-        for line in result.stdout.splitlines():
-            if "Admin State" in line or "---" in line:
-                continue
-            if not line.strip():
-                continue
-            parts = re.split(r"\s{2,}", line.strip())
-            if len(parts) < 4:
-                continue
-            rows.append(
-                {
-                    "admin_state": parts[0],
-                    "state": parts[1],
-                    "type": parts[2],
-                    "name": parts[3],
-                }
-            )
-        return rows
-
-    def windows_wlan_blocks(self) -> List[Dict[str, str]]:
-        result = run_command([NETSH_BIN, "wlan", "show", "interfaces"], timeout=5)
-        if result.returncode != 0:
-            return []
-
-        blocks: List[Dict[str, str]] = []
-        current: Dict[str, str] = {}
-        for raw_line in result.stdout.splitlines():
-            line = raw_line.strip()
-            if not line:
-                if current:
-                    blocks.append(current)
-                    current = {}
-                continue
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            current[key.strip().lower()] = value.strip()
-
-        if current:
-            blocks.append(current)
-        return blocks
-
-    def find_windows_wlan_block(self, interface: str) -> Optional[Dict[str, str]]:
-        for block in self.windows_wlan_blocks():
-            if block.get("name") == interface:
-                return block
-        return None
-
-    def is_wifi_interface(self, interface: str) -> bool:
-        if IS_MACOS:
-            self.refresh_macos_wifi_interfaces()
-            if interface in self.macos_wifi_interfaces:
-                return True
-
-            port = self.interface_hardware_port(interface)
-            if not port:
-                return False
-            normalized = port.lower()
-            return "wi-fi" in normalized or "airport" in normalized
-
-        if IS_LINUX:
-            base = Path("/sys/class/net") / interface
-            return (base / "wireless").exists() or (base / "phy80211").exists()
-
-        if IS_WINDOWS:
-            return self.find_windows_wlan_block(interface) is not None
-
-        return False
-
-    def interface_is_active(self, interface: str) -> bool:
-        if IS_MACOS:
-            result = run_command([IFCONFIG_BIN, interface], timeout=5)
-            if result.returncode != 0:
-                return False
-            if "status: active" in result.stdout:
-                return True
-            addr_result = run_command([IPCONFIG_BIN, "getifaddr", interface], timeout=5)
-            return addr_result.returncode == 0 and bool(addr_result.stdout.strip())
-
-        if IS_LINUX:
-            return self.linux_interface_is_active(interface)
-
-        if IS_WINDOWS:
-            wlan_block = self.find_windows_wlan_block(interface)
-            if wlan_block is not None:
-                return wlan_block.get("state", "").lower() == "connected"
-            for row in self.windows_interface_rows():
-                if row["name"] == interface:
-                    return row["state"].lower() == "connected"
-            return False
-
-        raise ConfigError(f"unsupported platform: {SYSTEM}")
-
-    def current_ssid(self, interface: str) -> Optional[str]:
-        if IS_MACOS:
-            result = run_command([NETWORKSETUP_BIN, "-getairportnetwork", interface], timeout=5)
-            output = (result.stdout or "").strip()
-            if result.returncode != 0 and not output:
-                return None
-            prefix = "Current Wi-Fi Network: "
-            if output.startswith(prefix):
-                ssid = output[len(prefix) :].strip()
-                return ssid or None
-            if "AuthorizationCreate() failed" in output:
-                return None
-            return None
-
-        if IS_LINUX:
-            if shutil.which(IWGETID_BIN):
-                result = run_command([IWGETID_BIN, "-r", interface], timeout=5)
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
-
-            if shutil.which(IW_BIN):
-                result = run_command([IW_BIN, "dev", interface, "link"], timeout=5)
-                if result.returncode == 0:
-                    match = re.search(r"SSID:\s*(.+)", result.stdout)
-                    if match:
-                        return match.group(1).strip()
-
-            if shutil.which(NMCLI_BIN):
-                result = run_command(
-                    [NMCLI_BIN, "-t", "-f", "DEVICE,ACTIVE,SSID", "dev", "wifi"],
-                    timeout=5,
-                )
-                if result.returncode == 0:
-                    for line in result.stdout.splitlines():
-                        parts = line.split(":", 2)
-                        if len(parts) != 3:
-                            continue
-                        device, active, ssid = parts
-                        if device == interface and active == "yes":
-                            return ssid or None
-            return None
-
-        if IS_WINDOWS:
-            wlan_block = self.find_windows_wlan_block(interface)
-            if not wlan_block:
-                return None
-            ssid = wlan_block.get("ssid")
-            return ssid or None
-
-        return None
-
-    def ping_is_alive(self, address: str, bind: str) -> bool:
-        if IS_MACOS:
-            args = [PING_BIN, "-c", "1", "-W", "2000"]
-            if bind:
-                args.extend(["-b", bind])
-            args.append(address)
-            result = run_command(args, timeout=5, capture_output=False)
-            return result.returncode == 0
-
-        if IS_LINUX:
-            args = [PING_BIN, "-c", "1", "-W", "2"]
-            if bind:
-                args.extend(["-I", bind])
-            args.append(address)
-            result = run_command(args, timeout=5, capture_output=False)
-            return result.returncode == 0
-
-        if IS_WINDOWS:
-            args = [PING_BIN, "-n", "1", "-w", "2000", address]
-            result = run_command(args, timeout=5, capture_output=False)
-            return result.returncode == 0
-
-        raise ConfigError(f"unsupported platform: {SYSTEM}")
-
     def run_curl(
         self,
         url: str,
@@ -859,16 +533,7 @@ class SCUNETAutologinDaemon:
 
         bind = bind.strip()
         if bind:
-            if IS_WINDOWS:
-                if looks_like_bind_address(bind):
-                    args.extend(["--interface", bind])
-                else:
-                    logging.debug(
-                        "ignoring login_bind=%s on Windows; use a local IPv4 address if binding is needed",
-                        bind,
-                    )
-            else:
-                args.extend(["--interface", bind])
+            args.extend(["--interface", bind])
 
         if post_data is not None:
             args.extend(["-X", "POST", "-d", post_data])
@@ -915,34 +580,6 @@ class SCUNETAutologinDaemon:
 
         return "non_portal", "SCUNET portal was not detected", None
 
-    def should_attempt_login(self, config: Config) -> Tuple[bool, str]:
-        if not self.interface_is_active(config.detect_interface):
-            return False, f"interface {config.detect_interface} is not active"
-
-        if self.is_wifi_interface(config.detect_interface):
-            ssid = self.current_ssid(config.detect_interface)
-            if not config.target_ssid:
-                return True, "connected to a Wi-Fi network"
-            if ssid == config.target_ssid:
-                return True, f"connected to target SSID {ssid}"
-            if ssid is None:
-                portal_state, portal_reason, _ = self.probe_portal(
-                    config,
-                    connect_timeout_seconds=1,
-                    max_time_seconds=2,
-                )
-                if portal_state in {"online", "login_required"}:
-                    return True, "SSID unavailable, but SCUNET portal was detected"
-                if config.allow_unknown_wifi_name:
-                    return True, "Wi-Fi name unavailable, but unknown Wi-Fi is allowed"
-                return False, f"SSID unavailable and {portal_reason.lower()}"
-            return False, f"current SSID does not match target ({ssid or 'unknown'})"
-
-        if config.target_ssid:
-            return False, f"interface {config.detect_interface} is not a Wi-Fi adapter"
-
-        return True, f"active non-Wi-Fi interface {config.detect_interface}"
-
     def login(
         self,
         config: Config,
@@ -983,60 +620,6 @@ class SCUNETAutologinDaemon:
             self.update_state("auto login is disabled", config)
             return config.idle_interval_seconds
 
-        # On macOS, portal detection is more reliable than querying Wi-Fi metadata,
-        # and it avoids repeated timeouts from system_profiler/networksetup.
-        if IS_MACOS and config.target_ssid:
-            portal_state, portal_message, query_string = self.probe_portal(
-                config,
-                connect_timeout_seconds=config.preflight_connect_timeout_seconds,
-                max_time_seconds=config.preflight_max_time_seconds,
-            )
-            if portal_state == "online":
-                self.update_state(portal_message, config)
-                return config.poll_interval_seconds
-            if portal_state == "non_portal":
-                self.update_state(portal_message, config)
-                return config.poll_interval_seconds
-            if portal_state == "offline":
-                self.update_state(f"portal probe failed: {portal_message}", config)
-                return config.poll_interval_seconds
-
-            self.update_state("SCUNET portal detected", config)
-
-            gap = time.monotonic() - self.last_login_attempt_at
-            if gap < config.min_login_interval_seconds:
-                remaining = int(config.min_login_interval_seconds - gap)
-                self.update_state(f"waiting for login cooldown ({remaining}s remaining)", config)
-                return config.poll_interval_seconds
-
-            if dry_run:
-                self.update_state("dry-run: login would be triggered now", config)
-                return config.poll_interval_seconds
-
-            self.last_login_attempt_at = time.monotonic()
-            logging.info("portal probe requires login, trying portal login")
-            self.maybe_notify_login_attempt(config)
-
-            try:
-                success, message = self.login(
-                    config,
-                    precomputed_query_string=query_string,
-                )
-            except (CommandError, ConfigError) as exc:
-                self.update_state(f"login command failed: {exc}", config)
-                return config.poll_interval_seconds
-
-            if success:
-                self.update_state(message, config)
-            else:
-                self.update_state(f"login failed: {message}", config)
-            return config.poll_interval_seconds
-
-        should_attempt, reason = self.should_attempt_login(config)
-        if not should_attempt:
-            self.update_state(reason, config)
-            return config.idle_interval_seconds
-
         portal_state, portal_message, query_string = self.probe_portal(config)
         if portal_state == "online":
             self.update_state(portal_message, config)
@@ -1048,7 +631,7 @@ class SCUNETAutologinDaemon:
             self.update_state(f"portal probe failed: {portal_message}", config)
             return config.poll_interval_seconds
 
-        self.update_state(reason, config)
+        self.update_state("SCUNET portal detected", config)
 
         gap = time.monotonic() - self.last_login_attempt_at
         if gap < config.min_login_interval_seconds:
@@ -1105,7 +688,7 @@ class SCUNETAutologinDaemon:
 def parse_args() -> argparse.Namespace:
     default_config = Path(__file__).resolve().with_name(DEFAULT_CONFIG_NAME)
     parser = argparse.ArgumentParser(
-        description="Cross-platform SCUNET auto-login daemon."
+        description="macOS SCUNET auto-login daemon."
     )
     parser.add_argument(
         "--config",
@@ -1138,6 +721,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not IS_MACOS:
+        print("SCUNET autologin now only supports macOS.", file=sys.stderr)
+        return 1
     setup_logging(args.verbose)
 
     if args.check_config:
@@ -1147,8 +733,7 @@ def main() -> int:
             logging.error("%s", exc)
             return 1
         logging.info(
-            "config OK: platform=%s username=%s detect_interface=%s password_source=%s",
-            SYSTEM,
+            "config OK: username=%s detect_interface=%s password_source=%s",
             config.username,
             config.detect_interface,
             config.password_source,
